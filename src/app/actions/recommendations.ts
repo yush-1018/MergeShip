@@ -9,6 +9,7 @@ import { ok, err, type Result } from '@/lib/result';
 import { cacheGet, cacheSet, cacheDel } from '@/lib/cache';
 import { filterAndRank, type ScoredIssue } from '@/lib/pipeline/recommend';
 import { getAllowedDifficulties } from '@/lib/pipeline/difficulty';
+import { getInstallOctokit } from '@/lib/github/app';
 
 /**
  * Server actions for the recommendation lifecycle.
@@ -200,23 +201,39 @@ export async function linkPrToRec(recId: number, prUrl: string): Promise<Result<
   if (!rateRes.ok) return err('rate_limited', 'slow down', true, rateRes.resetAt);
 
   // Security: verify the authenticated user actually authored this PR.
-  const sessionRes = await sb.auth.getSession();
-  const token = sessionRes.data.session?.provider_token;
-  if (!token) return err('no_github_token', 'reconnect your GitHub account');
-
   const match = trimmed.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)$/);
   if (!match)
     return err('invalid_url', 'paste a full https://github.com/<owner>/<repo>/pull/<n> URL');
-  const [, owner, repo, number] = match;
+  const [, owner, repo, numberStr] = match;
+  if (!owner || !repo || !numberStr) {
+    return err('invalid_url', 'paste a full https://github.com/<owner>/<repo>/pull/<n> URL');
+  }
+  const number = parseInt(numberStr, 10);
 
-  const ghRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${number}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!ghRes.ok)
+  const repoFullName = `${owner}/${repo}`;
+  const { data: repoRow } = await service
+    .from('installation_repositories')
+    .select('installation_id')
+    .ilike('repo_full_name', repoFullName)
+    .maybeSingle();
+
+  if (!repoRow?.installation_id) {
+    return err('not_found', 'repository is not managed by MergeShip');
+  }
+
+  let prAuthorLogin: string | undefined;
+  try {
+    const octokit = await getInstallOctokit(repoRow.installation_id);
+    const prRes = await octokit.pulls.get({
+      owner,
+      repo,
+      pull_number: number,
+    });
+    prAuthorLogin = prRes.data.user?.login?.toLowerCase();
+  } catch (e: any) {
+    console.error('Failed to fetch PR via install Octokit:', e);
     return err('github_fetch_failed', 'could not fetch PR from GitHub — check the URL');
-
-  const prData = (await ghRes.json()) as { user?: { login?: string } };
-  const prAuthorLogin = prData.user?.login?.toLowerCase();
+  }
 
   const { data: profile } = await service
     .from('profiles')

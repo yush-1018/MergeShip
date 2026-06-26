@@ -6,6 +6,7 @@ import { ok, err, type Result } from '@/lib/result';
 import { rateLimit, RATE_LIMIT_TIERS } from '@/lib/rate-limit';
 import { cacheDel, cacheGet, cacheSet } from '@/lib/cache';
 import { repoFilterPattern } from './issues-helpers';
+import { getInstallOctokit } from '@/lib/github/app';
 
 const PAGE_SIZE = 10;
 
@@ -80,7 +81,7 @@ export async function getRepoOptions(): Promise<Result<RepoOption[]>> {
 
       const { data: repoRows } = await service
         .from('installation_repositories')
-        .select('repo_full_name')
+        .select('repo_full_name, installation_id')
         .in('installation_id', instIds);
 
       const userRepos = [
@@ -88,29 +89,30 @@ export async function getRepoOptions(): Promise<Result<RepoOption[]>> {
       ];
       if (userRepos.length === 0) return ok([]);
 
-      // Get provider token so we can call GitHub API to detect forks
-      const sessionRes = await sb.auth.getSession();
-      const token = sessionRes.data.session?.provider_token;
+      const repoToInstallMap = new Map<string, number>();
+      for (const r of repoRows ?? []) {
+        repoToInstallMap.set(r.repo_full_name, r.installation_id);
+      }
 
       // Resolve each repo: if it's a fork, use the upstream (parent) as the issues source
       const options = await Promise.all(
         userRepos.map(async (repo): Promise<RepoOption> => {
-          if (!token) return { label: repo, value: repo };
+          const installationId = repoToInstallMap.get(repo);
+          if (!installationId) return { label: repo, value: repo };
           try {
-            const res = await fetch(`https://api.github.com/repos/${repo}`, {
-              headers: {
-                Authorization: `Bearer ${token}`,
-                Accept: 'application/vnd.github+json',
-                'X-GitHub-Api-Version': '2022-11-28',
-              },
+            const octokit = await getInstallOctokit(installationId);
+            const [, owner, repoName] = repo.match(/^([^/]+)\/(.+)$/) || [];
+            if (!owner || !repoName) return { label: repo, value: repo };
+            const { data } = await octokit.repos.get({
+              owner,
+              repo: repoName,
             });
-            if (!res.ok) return { label: repo, value: repo };
-            const data = (await res.json()) as { fork?: boolean; parent?: { full_name: string } };
             if (data.fork && data.parent?.full_name) {
               return { label: repo, value: data.parent.full_name };
             }
             return { label: repo, value: repo };
-          } catch {
+          } catch (err) {
+            console.error(`Failed to fetch repo ${repo} via installation octokit:`, err);
             return { label: repo, value: repo };
           }
         }),

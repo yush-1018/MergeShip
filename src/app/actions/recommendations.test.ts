@@ -11,8 +11,14 @@ const mocks = vi.hoisted(() => {
     mockRateLimit: vi.fn(),
     mockTryGetDb: vi.fn(),
     mockSql: vi.fn((strings, ...values) => ({ strings, values })),
+    mockGetInstallOctokit: vi.fn(),
+    mockPullsGet: vi.fn(),
   };
 });
+
+vi.mock('@/lib/github/app', () => ({
+  getInstallOctokit: mocks.mockGetInstallOctokit,
+}));
 
 vi.mock('@/lib/supabase/server', () => ({
   getServerSupabase: vi.fn(() => ({
@@ -96,6 +102,7 @@ const createMockChain = (chainResult: unknown, singleResult: unknown = null) => 
     update: vi.fn().mockReturnThis(),
     eq: vi.fn().mockReturnThis(),
     in: vi.fn().mockReturnThis(),
+    ilike: vi.fn().mockReturnThis(),
     gte: vi.fn().mockReturnThis(),
     order: vi.fn().mockReturnThis(),
     limit: vi.fn().mockReturnThis(),
@@ -138,6 +145,14 @@ describe('Recommendations Server Actions', () => {
     });
     mocks.mockRateLimit.mockResolvedValue({ ok: true });
     mocks.mockServiceFrom.mockImplementation(() => createMockChain(null, null));
+    mocks.mockGetInstallOctokit.mockResolvedValue({
+      pulls: {
+        get: mocks.mockPullsGet,
+      },
+    });
+    mocks.mockPullsGet.mockResolvedValue({
+      data: { user: { login: 'testuser' } },
+    });
     vi.stubGlobal(
       'fetch',
       vi.fn().mockResolvedValue({
@@ -384,6 +399,8 @@ describe('Recommendations Server Actions', () => {
   describe('linkPrToRec', () => {
     it('updates linked_pr_url when URL is valid and user is PR author', async () => {
       mocks.mockServiceFrom
+        // installation_repositories lookup
+        .mockReturnValueOnce(createMockChain(null, { data: { installation_id: 123 }, error: null }))
         // profiles lookup
         .mockReturnValueOnce(
           createMockChain(null, { data: { github_handle: 'testuser' }, error: null }),
@@ -395,6 +412,12 @@ describe('Recommendations Server Actions', () => {
 
       expect(result).toEqual({ ok: true, data: { id: 1 } });
       expect(mocks.mockCacheDel).toHaveBeenCalledWith('recs:test-user-id');
+      expect(mocks.mockGetInstallOctokit).toHaveBeenCalledWith(123);
+      expect(mocks.mockPullsGet).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        pull_number: 123,
+      });
     });
 
     it('returns invalid_url for non-GitHub URLs', async () => {
@@ -405,16 +428,16 @@ describe('Recommendations Server Actions', () => {
     });
 
     it('returns not_your_pr when PR author does not match github_handle', async () => {
-      vi.stubGlobal(
-        'fetch',
-        vi.fn().mockResolvedValue({
-          ok: true,
-          json: async () => ({ user: { login: 'someone-else' } }),
-        }),
-      );
-      mocks.mockServiceFrom.mockReturnValueOnce(
-        createMockChain(null, { data: { github_handle: 'testuser' }, error: null }),
-      );
+      mocks.mockPullsGet.mockResolvedValueOnce({
+        data: { user: { login: 'someone-else' } },
+      });
+      mocks.mockServiceFrom
+        // installation_repositories lookup
+        .mockReturnValueOnce(createMockChain(null, { data: { installation_id: 123 }, error: null }))
+        // profiles lookup
+        .mockReturnValueOnce(
+          createMockChain(null, { data: { github_handle: 'testuser' }, error: null }),
+        );
 
       const result = await linkPrToRec(1, 'https://github.com/owner/repo/pull/123');
 
@@ -423,7 +446,10 @@ describe('Recommendations Server Actions', () => {
     });
 
     it('returns github_fetch_failed when GitHub API returns an error', async () => {
-      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false }));
+      mocks.mockPullsGet.mockRejectedValueOnce(new Error('GitHub API Error'));
+      mocks.mockServiceFrom.mockReturnValueOnce(
+        createMockChain(null, { data: { installation_id: 123 }, error: null }),
+      );
 
       const result = await linkPrToRec(1, 'https://github.com/owner/repo/pull/123');
 
@@ -431,8 +457,19 @@ describe('Recommendations Server Actions', () => {
       if (!result.ok) expect(result.error.code).toBe('github_fetch_failed');
     });
 
+    it('returns not_found when repository is not managed by MergeShip', async () => {
+      mocks.mockServiceFrom.mockReturnValueOnce(createMockChain(null, { data: null, error: null }));
+
+      const result = await linkPrToRec(1, 'https://github.com/owner/repo/pull/123');
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe('not_found');
+    });
+
     it('returns not_linkable when rec is not open/claimed', async () => {
       mocks.mockServiceFrom
+        // installation_repositories lookup
+        .mockReturnValueOnce(createMockChain(null, { data: { installation_id: 123 }, error: null }))
         // profiles lookup
         .mockReturnValueOnce(
           createMockChain(null, { data: { github_handle: 'testuser' }, error: null }),

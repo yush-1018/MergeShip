@@ -19,6 +19,12 @@ const mocks = vi.hoisted(() => ({
   mockGetUser: vi.fn(),
   mockGetSession: vi.fn(),
   mockServiceFrom: vi.fn(),
+  mockGetInstallOctokit: vi.fn(),
+  mockReposGet: vi.fn(),
+}));
+
+vi.mock('@/lib/github/app', () => ({
+  getInstallOctokit: mocks.mockGetInstallOctokit,
 }));
 
 vi.mock('@/lib/supabase/server', () => ({
@@ -34,6 +40,12 @@ vi.mock('@/lib/supabase/service', () => ({
   getServiceSupabase: vi.fn(() => ({
     from: mocks.mockServiceFrom,
   })),
+}));
+
+vi.mock('@/lib/cache', () => ({
+  cacheGet: vi.fn().mockResolvedValue(null),
+  cacheSet: vi.fn().mockResolvedValue(null),
+  cacheDel: vi.fn().mockResolvedValue(null),
 }));
 
 import { getIssuesPage, getRepoOptions } from './issues';
@@ -60,6 +72,14 @@ describe('getRepoOptions', () => {
     mocks.mockGetSession.mockResolvedValue({
       data: { session: null },
     });
+    mocks.mockGetInstallOctokit.mockResolvedValue({
+      repos: {
+        get: mocks.mockReposGet,
+      },
+    });
+    mocks.mockReposGet.mockResolvedValue({
+      data: { fork: false },
+    });
   });
 
   it('returns empty array when user has no installations', async () => {
@@ -70,6 +90,36 @@ describe('getRepoOptions', () => {
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.data).toEqual([]);
+    }
+  });
+
+  it('resolves repository parent if it is a fork', async () => {
+    mocks.mockServiceFrom.mockImplementation((table: string) => {
+      if (table === 'github_installations') {
+        return createMockChain({ data: [{ id: 10 }] });
+      }
+      if (table === 'installation_repositories') {
+        return createMockChain({
+          data: [{ repo_full_name: 'owner/fork-repo', installation_id: 10 }],
+        });
+      }
+      return createMockChain({ data: [] });
+    });
+
+    mocks.mockReposGet.mockResolvedValueOnce({
+      data: { fork: true, parent: { full_name: 'upstream/original-repo' } },
+    });
+
+    const result = await getRepoOptions();
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.data).toEqual([{ label: 'owner/fork-repo', value: 'upstream/original-repo' }]);
+      expect(mocks.mockGetInstallOctokit).toHaveBeenCalledWith(10);
+      expect(mocks.mockReposGet).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'fork-repo',
+      });
     }
   });
 });
